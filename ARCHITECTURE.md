@@ -27,6 +27,93 @@ SRAM.** Static globals in anonymous namespaces with `alignas(4)` work.
 LAN9303 is a 3-port managed L2 switch. The MCU connects to one of its
 ports via RMII; the SBC and an external RJ45 jack hang off the other two.
 
+### LAN9303 — port map, management access, and the VLAN-isolation trade-off
+
+**Port map** (rosbot_xl only — confirmed against the schematic): Port 0 is
+RMII, no magnetics, direct to the MCU (`ETH_TXD0/1`, `ETH_RXD0/1`,
+`ETH_TXEN`, `ETH_CRSDV`) — this is `CLIENT_IP`/192.168.77.3. Port 1 goes
+through magnetics to the SBC. Port 2 goes through separate magnetics to the
+external RJ45 jack on the chassis. Factory default is an unmanaged flat
+bridge across all three — no VLAN, no port isolation.
+
+**Management access exists on this board, unused by the firmware today.**
+Two independent paths reach the switch fabric's CSRs, both confirmed wired
+on the schematic:
+- **MDIO/SMI** — pins 21/20 (`MDIO`/`MDC`) land on nets `ETH_MDIO`/`ETH_MDC`,
+  same prefix as the RMII bus to the MCU, i.e. the same pins
+  `STM32Ethernet`'s `ethernetif.cpp` already uses for ordinary PHY register
+  reads (`PHY_BSR`/`PHY_BCR` via `LAN9303_To_SMI_Address_Conv`). SMI reuses
+  the MDIO/MDC pins with **extended addressing** (PHY address 16–31, vs.
+  plain MIIM 0–15) to reach *all* internal registers, not just the Port 1/2
+  PHYs — see LAN9303/LAN9303i datasheet (Microchip DS00002308A) §10.2. The
+  address-conversion formula, confirmed against `ethernetif.cpp` and
+  hand-verified against the datasheet: for a system-register byte offset
+  `off`, `SMI_PHY_ADDR = 0x10 | ((off >> 6) & 0xF)`,
+  `SMI_REG_ADDR = ((off >> 1) & 0x1F) | word_select` (`word_select` is 0 for
+  the low 16 bits of the 32-bit register, 1 for the high 16 bits — two SMI
+  transactions per 32-bit register).
+- **I2C** — `EE_SDA`/`EE_SCL` (pins 35/36) sit on the MCU's `I2C2`
+  (PF0/PF1) — the **same bus** the BNO055 IMU and the board-revision EEPROM
+  already use (`ARCHITECTURE.md` table above, `BoardRevision` class). An
+  EEPROM lives on that bus (all revisions except the very oldest).
+
+**Register access, two levels of indirection** (datasheet §13.2.4.4-5,
+§13.4.3): `SWITCH_CSR_DATA` (system-register byte offset `0x1AC`) and
+`SWITCH_CSR_CMD` (`0x1B0`, bit 31 `CSR_BUSY`, bit 30 `R_nW`, bits 15:0
+`CSR_ADDR`) are reached directly via the SMI formula above, and are
+themselves used to indirectly read/write the actual Switch Fabric CSRs
+(VLAN table, ingress config, etc. — Table 13-14 in the datasheet), addressed
+by a *second*, independent 16-bit index (e.g. `SWE_VLAN_CMD` = `0x180B`,
+`SWE_GLB_INGRESS_CFG` = `0x1840`, `SWE_PORT_INGRESS_CFG` = `0x1841`): write
+`SWITCH_CSR_DATA`, then `SWITCH_CSR_CMD` with `CSR_BUSY` set and the target
+index, poll until `CSR_BUSY` clears.
+
+**VLAN table** (datasheet §6.4.4, §13.4.3.8-11): 16 slots, each holding a
+VID plus a member/untag bit per port (bits 17/16 = Port 2 member/untag,
+15/14 = Port 1, 13/12 = Port 0). Port-based (untagged) operation forcible
+via the "802.1Q VLAN Disable" bit in `SWE_GLB_INGRESS_CFG`, which makes the
+switch use each port's PVID instead of any 802.1Q tag — relevant since none
+of Port 0/1/2's traffic is ever tagged today.
+
+**What was tried and reverted (2026-08-27, branch
+`feature/lan9303-vlan-isolation`, never merged):** `192.168.77.2` is
+hardcoded identical on every rosbot_xl unit — deliberate, since the MCU
+needs a fixed address for the SBC. Because the factory-default flat bridge
+puts Port 0/1/2 on one broadcast domain, that address (and the MCU's
+`192.168.77.3`) leaks onto Port 2 — confirmed on hardware as a real ARP
+conflict (`NetworkManager`: *"IP address 192.168.77.2 cannot be configured
+because it is already in use... by host ..."*) when a second rosbot_xl
+shares the same external switch. VLAN 1 = {Port 0, Port 1} / VLAN 2 =
+{Port 2} via the mechanism above cleanly stops the leak (verified: the
+conflict is gone, the MAVLink bridge over Port 0↔Port 1 keeps working
+normally since the MCU and SBC stay in the same VLAN) — **but simple
+port-based VLAN can't do this selectively.** Isolating Port 2 from Port 1
+also cuts the SBC off from *all* external connectivity through the RJ45
+jack, not just the `192.168.77.0/24` leak — the SBC's own DHCP-assigned
+address, and the documented "plug a laptop directly into the robot and
+reach it at `192.168.77.2`" workflow (`husarion-os`'s `husarion-eth-mode`,
+which runs `isc-dhcp-server` on that exact assumption), both stop working
+the moment isolation is active, since Port 1 and Port 2 no longer bridge at
+all. Confirmed on hardware (2026-08-27): after flashing, the SBC's wired
+interface never acquires a DHCP lease from the external network again.
+
+**The correct fix, not yet built:** make Port 1 an 802.1Q trunk — tagged
+member of VLAN 1 (for MCU traffic) *and* untagged/native member of VLAN 2
+(for everything else), via the LAN9303's "Hybrid" port mode
+(`BM_EGRSS_PORT_TYPE`, datasheet §13.2.x — not yet looked up in detail).
+That needs a matching change on the SBC side (`husarion-os`): a tagged VLAN
+sub-interface (e.g. `enP8p1s0.1`) carrying `192.168.77.2`, with the plain
+untagged interface going back to ordinary DHCP-only for external
+connectivity. Firmware-only work can't finish this — it's a coordinated
+change across `rosbot-firmware` and `husarion-os`. The reverted branch
+(`feature/lan9303-vlan-isolation`) has a working, hardware-verified
+`lib/lan9303/` driver (SMI/CSR access + VLAN table writes, with a
+verify-before-enforce safety invariant — see the file's own comments) that
+implements the *simple* (non-trunk) isolation; it's a reasonable starting
+point for the register-access plumbing if someone builds the trunk version,
+but its `isolateExternalPort()` call in `main.cpp` should NOT be re-enabled
+as-is given the trade-off above.
+
 ---
 
 ## Variant model — how the dispatcher works
@@ -78,14 +165,16 @@ Layers, bottom-up:
 | dir | role |
 |---|---|
 | `battery/` | `BatteryInterface` + `BatteryAdc` (rosbot battery via ADC) |
-| `comm_manager/` | `CommunicationManager` — chooses primary vs diagnostic transport at boot based on push button |
+| `boot_option/` | `resolveBootAction()` — classifies the power-on button gesture (tap vs 3 s hold) into "change transport" / "calibrate IMU" / nothing, owns the confirmation LEDs — see "IMU calibration" under "Patterns" |
+| `comm_manager/` | `CommunicationManager` — chooses primary vs diagnostic transport at boot, driven by `boot_option`'s decision |
 | `eeprom/` | I2C EEPROM driver + `BoardRevision` (revision string read on rosbot_xl) |
 | `encoder/` | `EncoderInterface` + `HardwareEncoder` (STM32 timer in encoder mode, x4) |
 | `fan/` | Fan + NTC thermistor (rosbot_xl only) |
-| `imu/` | `ImuInterface` + `ImuBno055` (BNO055, DMA path — see "Patterns") |
+| `imu/` | `ImuInterface` + `ImuBno055` (BNO055, DMA path — see "Patterns"). Also exposes on-chip calibration status/offsets, persisted via `persistent_config` — see "IMU calibration" under "Patterns" |
 | `indicator/` | Status LED state machine |
 | `led_strip/` | APA102-style LED strip over SPI (rosbot_xl only) |
 | `motor/` | `MotorInterface`, `MotorHiZ`, `MotorArray` (Hi-Z PWM control) |
+| `persistent_config/` | Comm backend/namespace + BNO055 calibration offsets, stored as one record in flash sector 11. `save()` must run before the scheduler starts (sector erase stalls 1-3 s) — see "IMU calibration" |
 | `pid/` | PID controller with feedforward, anti-windup, dead-zone boost |
 | `power_board/` | UART protocol to rosbot_xl power board MCU (battery state) |
 | `range/` | `RangeInterface` + `RangeVl53l0x` + `RangeArray` (rosbot only) |
@@ -188,6 +277,92 @@ correct, position / velocity / effort all carry URDF-consistent sign.
 ---
 
 ## Patterns
+
+### IMU calibration
+
+The BNO055 fuses orientation on-chip (NDOF mode); a factory-fresh chip's
+fusion output can be several degrees off on roll/pitch until its
+accel/gyro/mag calibration registers are populated. There is no external
+storage on either board revision (no I2C EEPROM wired to the IMU bus, no
+VBAT-backed RTC domain), so calibration offsets ride in
+`persistent_config`'s flash-sector-11 record alongside the comm
+backend/namespace. `boards/rosbot_stm32f407.json`'s `upload.maximum_size`
+(917504 = the sector 10 boundary, not the chip's full 1 MB) makes the
+STM32duino core's linker script size the `FLASH` region to match, so a
+build that grows past sector 10 fails at link time instead of silently
+letting a reflash overwrite this record — see `persistent_config.hpp`.
+
+`persistent_config::save()` asserts the scheduler isn't running — a
+sector erase stalls 1-3 s, which would starve the motor watchdog and
+MAVLink TX DMA if it happened mid-drive. That rules out committing a
+calibration from a live ROS/MAVLink service call. Instead, calibration is
+a **boot-time window**, entirely inside `setup()` before
+`vTaskStartScheduler()`:
+
+1. `setup()` calls `resolveBootAction()` (`lib/boot_option/`) as the very
+   first thing after `boardPheripheralsInit()`, before anything else —
+   including `g_comm_mgr.selectTransport()` — reads the same buttons.
+   `resolveBootAction()` classifies a single press by how long it's held
+   and returns one of three mutually-exclusive actions, so there's no
+   coordination needed between the calibration path and the
+   diagnostic-transport path; they're just two outcomes of the same
+   decision:
+   - no press starts within `press_detect_window_ms` (1.5 s) of entry →
+     `kNone`, normal boot. This window exists because the button is only
+     read here, once, at the top of `setup()` — an operator who presses
+     it a few hundred ms after the reset edge (instead of holding through
+     it) would otherwise be missed entirely.
+   - pressed within that window, then released before the hold threshold
+     (3 s) → `kChangeTransport`. Green LED(s) latch on solid immediately
+     as confirmation.
+   - held past the threshold → `kCalibrateImu`, decided the instant the
+     threshold is crossed (doesn't wait for release). Green LED(s) blink
+     3x to confirm entry, then turn off.
+
+   rosbot passes both push buttons as interchangeable (either one
+   qualifies); rosbot_xl passes only `PUSH_BUTTON1` (`PUSH_BUTTON2` there
+   is wired to MCU `NRST`, not a readable GPIO). Boards with two green
+   LEDs (rosbot) light both together for every confirmation, so the two
+   robots read identically with one LED's worth of vocabulary.
+
+   `kChangeTransport` is wired to `g_comm_mgr`'s `useDiagnosticCondition`
+   callback (now just returns the precomputed bool — no more live GPIO
+   polling from inside that callback, and no `onDiagnosticSelected`
+   callback either, since BootOption already lit the LED).
+2. On `kCalibrateImu`, firmware polls `ImuBno055::getCalibrationStatus()`
+   in a blocking loop (RED_LED blinking, via `imu_calibration_boot::run()`
+   in `lib/imu/imu_calibration_boot.*` — shared by both variants) while
+   the operator moves the robot — gyro settles by sitting still, mag by a
+   figure-8 rotation, accel needs a few stable rests >45° apart, which is
+   awkward on an assembled wheeled robot; a fixture/stand is worth having
+   on a production line rather than relying on freehand tilting.
+3. On `sys/gyro/accel/mag == 3/3/3/3` (or a 120 s timeout), GRN_LED(s) go
+   solid, offsets are captured via `captureCalibrationOffsets()` and
+   folded into the same `persistent_config::Config` that's about to be
+   saved for comm backend/namespace — one erase+program cycle, not two.
+4. Every boot, if a calibration record is present,
+   `ImuBno055::applyCalibrationOffsets()` loads it into the chip right
+   after `init()`, so fusion starts pre-calibrated instead of drifting in
+   from scratch.
+
+Calibrating and switching to the diagnostic transport in the same boot
+isn't supported — the two are separate actions on the same gesture axis,
+not combinable. Wanting both means two boots (either order): both settle
+into the same persisted `Config`, so nothing is lost between them.
+
+There's deliberately no ROS/MAVLink service exposing calibration status
+live — `getCalibrationStatus()` only works via blocking Wire calls before
+`enableDmaReads()` (see the gotcha below), and no link exists yet at that
+point in boot anyway (ROS/MAVLink both come up well after this window,
+and after `enableDmaReads()`). A runtime service calling it would just
+fail. Progress is observable only via the diagnostic-serial logs and LEDs
+during the boot-time window itself — see `imu_calibration_boot::run()`.
+
+Step 2's blocking calls (`getCalibrationStatus()`,
+`captureCalibrationOffsets()`) only work because `main.cpp` calls
+`ImuBno055::init()` without following it with `enableDmaReads()` until
+*after* this whole window — see the "FreeRTOS-safe IRQ priorities"
+gotcha above for why that ordering matters.
 
 ### Hi-Z motor control
 
@@ -308,10 +483,22 @@ convention: lower number = higher priority. Any IRQ that calls
 The framework defaults I2C IRQs to priority 2 (above
 `configMAX_SYSCALL_INTERRUPT_PRIORITY`), which would crash if our
 override of `HAL_I2C_MemRxCpltCallback` ran a `*FromISR` call. The IMU
-DMA path lowers the EV/ER + DMA stream IRQ priority to 5 in init —
-canonical pattern in `lib/imu/imu_bno055.cpp`. Replicate this if you add
-another HAL-callback-driven path on top of a framework-managed
-peripheral.
+DMA path lowers the EV/ER + DMA stream IRQ priority to 5 — canonical
+pattern in `lib/imu/imu_bno055.cpp`. Replicate this if you add another
+HAL-callback-driven path on top of a framework-managed peripheral.
+
+**Gotcha (HW-verified 2026-08-26):** that priority change — and linking
+our DMA handle into `s_hi2c` via `__HAL_LINKDMA` — breaks Wire's own
+blocking transactions (`HAL_I2C_Master_Receive_IT`, what
+`Adafruit_BNO055`'s non-DMA calls use). Confirmed by probing the I2C bus
+directly before/after: reads succeed before, fail with a generic HAL
+error immediately after. Boot-time IMU calibration (see "IMU
+calibration" below) needs those blocking calls, so `ImuBno055::init()`
+only brings the chip up (NDOF mode, axis remap) — the DMA/IRQ setup is a
+separate `enableDmaReads()`, called once right before
+`vTaskStartScheduler()`, after calibration is done. `update()` no-ops
+safely (`s_done_sem == nullptr` guard) until then, and no task calls it
+before the scheduler starts anyway.
 
 ### DMA + FreeRTOS handshake
 
@@ -438,6 +625,16 @@ help:
 `framework-arduinoststm32` (Husarion fork), STM32Ethernet, LwIP,
 micro_ros_arduino, STM32FreeRTOS, Adafruit BNO055, VL53L0X. Then four
 concrete envs select variant + debug/release:
+
+`board = rosbot_stm32f407` is a repo-local definition in `boards/`
+(STM32F407ZGT6, generic `variant_generic.h` exposing all GPIO). It is the
+honestly-named successor to the misleading `rosbot_xl_digital_board` — both
+resolve to the identical generic F407ZG build (`ARDUINO_GENERIC_F407ZGTX`),
+shared by **both** variants. The Husarion `framework-arduinoststm32` fork is
+still required: it bumps the serial RX/TX buffers (64→512) and splits the
+Ethernet pin map into `PinMap_Ethernet_MII/RMII` so RMII mode only claims its
+9 pins (upstream's single `PinMap_Ethernet[]` would grab MII-only GPIO used
+elsewhere on rosbot_xl).
 
 - `[env:rosbot]` — debug, `-D ROSBOT`, `-D ENABLE_HWSERIAL1`,
   `-D ENABLE_HWSERIAL3`, `build_src_filter = +<rosbot/*> -<rosbot_xl/*>`.
