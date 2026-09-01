@@ -1,89 +1,72 @@
-# rosbot_mavlink_bridge
+# rosbot-firmware
 
-ROS 2 bridge that talks MAVLink to the firmware (`rosbot_mavlink` /
-`rosbot_xl_mavlink` PlatformIO envs) and exposes the **same** topics and
-services that the existing micro-ROS firmware advertises today. From a
-downstream consumer's perspective (e.g. the `rosbot_ros` driver inside
-[rosbot-snap](https://github.com/husarion/rosbot-snap)), there is no
-migration: same node name, same namespace, same QoS — only the wire format
-changes.
+STM32F4 firmware for ROSbot 3 and ROSbot XL. Ships in **two flavours** —
+classic **micro-ROS** and the newer **MAVLink + bridge** — that expose the
+same ROS 2 API to downstream consumers.
 
-See [`MAVLINK_MIGRATION.md`](../../MAVLINK_MIGRATION.md) for the full
-implementation spec.
+## Two firmware flavours
 
-## Build
+| Aspect | `rosbot[_xl]` (micro-ROS) | `rosbot[_xl]_mavlink` (MAVLink) |
+|---|---|---|
+| Wire protocol | XRCE-DDS | MAVLink v2 (`rosbot` dialect, [spec](./MAVLINK_MIGRATION.md)) |
+| SBC side | `micro_ros_agent` | [`rosbot_mavlink_bridge`](./bridge/rosbot_mavlink_bridge) |
+| SBC distro coupling | jazzy-pinned by `micro_ros_arduino` | distro-agnostic — one `.bin` for every ROS 2 distro the bridge ships for |
+| ROS 2 API | `rosbot_mcu` node, topics in `ROS_API.md` | **identical** node name, topics, QoS — downstream nodes can't tell |
+| Status | shipping (default) | shipping alongside on `jazzy` |
 
-The bridge is a regular `ament_cmake` package and is **self-contained** —
-the MAVLink dialect headers it needs are the canonical
-[`mavlink_dialect/`](./mavlink_dialect/) tree shipped inside the package.
-`just mavgen` (from the repo root) regenerates them in place; the
-firmware build (PlatformIO) reads from the same directory via its
-include path. Single source of truth, no duplication.
+Pick the MAVLink flavour to drop the `micro_ros_agent` dependency on the SBC
+and run the firmware against any ROS 2 distro (jazzy, humble, future). Pick
+the micro-ROS flavour to stay on the known-good path. Switching is just a
+re-flash + restart of the SBC-side process.
+
+## Build and flash
+
+Day-to-day workflow on the ROSbot SBC uses [`just`](./justfile):
 
 ```bash
-# from the repo root
-colcon build --packages-select rosbot_mavlink_bridge
-. install/setup.bash
+just install-deps           # one-time: pymavlink + platformio in a venv
+just build rosbot_xl        # micro-ROS variant
+just build rosbot_xl_mavlink  # MAVLink variant
+just flash rosbot_xl_mavlink  # builds and flashes via FTDI
+just mavgen                  # regen MAVLink dialect headers
+just --list                  # see every recipe
 ```
 
-The CI matrix builds the same source tree against both `jazzy` and
-`humble` containers (see `.github/workflows/ci.yaml` — D24).
+`just flash` wraps `ros2 run rosbot_utils flash_firmware`; see
+[`CONTRIBUTING.md`](./CONTRIBUTING.md) and [`scripts/flash.sh`](./scripts/flash.sh)
+for the details and PlatformIO env names.
 
-### Apt install (rosdistro)
+## Run the SBC side
 
-Once released through bloom, the bridge is available as
-`ros-<distro>-rosbot-mavlink-bridge` and is pulled in automatically as an
-`exec_depend` of `rosbot_bringup`. Users on apt do not need this repo —
-the bridge ships alongside `rosbot_ros`.
-
-## Run
-
-ROSbot XL (UDP transport):
+**micro-ROS:** start the agent against the firmware's transport.
 
 ```bash
+# rosbot_xl (Ethernet)
+ros2 run micro_ros_agent micro_ros_agent udp4 --port 8888
+
+# rosbot (Serial)
+ros2 run micro_ros_agent micro_ros_agent serial --dev <serial_port> --baud 921600
+```
+
+**MAVLink:** launch the bridge from this repo (or the released tarball).
+
+```bash
+# rosbot_xl (Ethernet, mavros default ports)
 ros2 launch rosbot_mavlink_bridge rosbot_xl.launch.py namespace:=rosbot
-```
 
-ROSbot (serial transport — pick the SBC's SBC<->MCU UART):
-
-```bash
+# rosbot (Serial)
 ros2 launch rosbot_mavlink_bridge rosbot.launch.py namespace:=rosbot \
   --ros-args -p serial_port:=/dev/ttyS4
 ```
 
-The bridge waits for the firmware's boot banner
-(`rosbot[_xl] <version> mavlink`) before declaring itself CONNECTED and
-publishing telemetry — that's the D19 mismatch detector.
+Either path advertises the same `/<ns>/rosbot_mcu` node with the same topic
+list, types and QoS — `rosbot_ros` (snap) consumes it unchanged.
 
-## Topics / services
+## Internals
 
-| Path (relative to namespace) | Type | QoS |
-|---|---|---|
-| `battery` | `sensor_msgs/BatteryState` | best_effort, depth 1 |
-| `_imu/data` | `sensor_msgs/Imu` | best_effort, depth 1 |
-| `_motors/feedback` | `sensor_msgs/JointState` | best_effort, depth 1 |
-| `buttons` | `std_msgs/UInt8` | best_effort, depth 1 |
-| `ranges` (rosbot only) | `sensor_msgs/Range` | best_effort, depth 1 |
-| `_motors/cmd` | `std_msgs/Float32MultiArray` | best_effort, depth 1 |
-| `leds` | `std_msgs/UInt8` | best_effort, depth 1 |
-| `led_strip` (rosbot_xl only) | `sensor_msgs/Image` | best_effort, depth 1 |
-| `_mcu_id` (service) | `std_srvs/Trigger` | — |
-
-`ros2 node info /<ns>/rosbot_mcu` and `ros2 topic info -v /<ns>/<topic>`
-output is byte-identical between this bridge and the micro-ROS agent — that
-is the Phase-4 acceptance criterion.
-
-## Parameters
-
-See `config/rosbot.yaml` and `config/rosbot_xl.yaml` for variants. Key
-parameters:
-
-- `transport`: `udp` | `serial`
-- `peer_ip` / `peer_port` / `local_port` — UDP only (mavros default ports)
-- `serial_port` / `serial_baudrate` — serial only
-- `ros_namespace` — prefixed onto every advertised topic/service/node name
-- `enable_ranges`, `enable_led_strip` — variant gates
-- `publish_link_state` — if true, advertise an extra `mcu_link_state`
-  `std_msgs/UInt8` topic for diagnostics (off by default for API parity)
-- `timesync_alpha` — EWMA factor for the time-offset filter (D15)
-- `expected_banner_regex` — boot-banner gate string
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — firmware architecture, RTOS task
+  layout, transport patterns, MAVLink stack overview.
+- [ROS_API.md](./ROS_API.md) — user-facing ROS topic / service contract
+  (true for both flavours).
+- [MAVLINK_MIGRATION.md](./MAVLINK_MIGRATION.md) — implementation spec for
+  the MAVLink stack, dialect IDs, phasing.
