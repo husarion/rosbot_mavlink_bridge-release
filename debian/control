@@ -1,0 +1,13 @@
+Source: ros-jazzy-rosbot-mavlink-bridge
+Section: misc
+Priority: optional
+Maintainer: "Husarion" <support@husarion.com>
+Build-Depends: debhelper (>= 9.0.0), ros-jazzy-ament-cmake, ros-jazzy-ament-lint-auto <!nocheck>, ros-jazzy-ament-lint-common <!nocheck>, ros-jazzy-rclcpp, ros-jazzy-sensor-msgs, ros-jazzy-std-msgs, ros-jazzy-std-srvs, ros-jazzy-ros-workspace
+Homepage: https://husarion.com/
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-rosbot-mavlink-bridge
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-rclcpp, ros-jazzy-sensor-msgs, ros-jazzy-std-msgs, ros-jazzy-std-srvs, ros-jazzy-ros-workspace
+Description: Bridge node that translates the firmware's MAVLink wire protocol into the same ROS 2 API the micro-ROS agent currently exposes, so downstream consumers (e.g.
+ rosbot_ros) see byte-identical topics/services. Single source tree builds for both jazzy and humble (see MAVLINK_MIGRATION.md D24).
